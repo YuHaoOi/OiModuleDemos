@@ -1,0 +1,111 @@
+package com.thanosfisherman.wifiutils.wifiConnect;
+
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.net.wifi.ScanResult;
+import android.net.wifi.SupplicantState;
+import android.net.wifi.WifiManager;
+import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
+
+import com.thanosfisherman.elvis.Objects;
+import com.thanosfisherman.wifiutils.WeakHandler;
+
+import static com.thanosfisherman.elvis.Elvis.of;
+import static com.thanosfisherman.wifiutils.ConnectorUtils.isAlreadyConnected;
+import static com.thanosfisherman.wifiutils.ConnectorUtils.reEnableNetworkIfPossible;
+import static com.thanosfisherman.wifiutils.WifiUtils.wifiLog;
+
+
+public final class WifiConnectionReceiver extends BroadcastReceiver {
+    @NonNull
+    private final WifiConnectionCallback mWifiConnectionCallback;
+    @Nullable
+    private ScanResult mScanResult;
+    @NonNull
+    private final WifiManager mWifiManager;
+    private long mDelay;
+    @NonNull
+    private final WeakHandler handler;
+    @NonNull
+    private final Runnable handlerCallback = new Runnable() {
+        @Override
+        public void run() {
+            wifiLog("Connection Timed out...");
+            //超时后再去连接一次，若失败走失败回调
+            reEnableNetworkIfPossible(mWifiManager, mScanResult);
+            if (isAlreadyConnected(mWifiManager, of(mScanResult).next(scanResult -> scanResult.BSSID).get()))
+                mWifiConnectionCallback.successfulConnect();
+            else
+                mWifiConnectionCallback.errorConnect();
+            handler.removeCallbacks(this);
+        }
+    };
+
+    public WifiConnectionReceiver(@NonNull WifiConnectionCallback callback, @NonNull WifiManager wifiManager, long delayMillis) {
+        this.mWifiConnectionCallback = callback;
+        this.mWifiManager = wifiManager;
+        this.mDelay = delayMillis;
+        this.handler = new WeakHandler();
+    }
+
+    @Override
+    public void onReceive(Context context, @NonNull Intent intent) {
+        final String action = intent.getAction();
+        wifiLog("Connection Broadcast action: " + action);
+        //网络连接状态发生改变
+        if (Objects.equals(WifiManager.NETWORK_STATE_CHANGED_ACTION, action)) {
+            //这里我们只是判断已经连接上wifi了，并不是说明有网络了
+            if (isAlreadyConnected(mWifiManager, of(mScanResult).next(scanResult -> scanResult.BSSID).get())) {
+                handler.removeCallbacks(handlerCallback);
+                mWifiConnectionCallback.successfulConnect();
+            }
+            //到接入点的连接的状态已经改变
+        } else if (Objects.equals(WifiManager.SUPPLICANT_STATE_CHANGED_ACTION, action)) {
+            final SupplicantState state = intent.getParcelableExtra(WifiManager.EXTRA_NEW_STATE);
+            final int supl_error = intent.getIntExtra(WifiManager.EXTRA_SUPPLICANT_ERROR, -1);
+
+            if (state == null) {
+                handler.removeCallbacks(handlerCallback);
+                mWifiConnectionCallback.errorConnect();
+                return;
+            }
+
+            wifiLog("Connection Broadcast action: " + state);
+
+            switch (state) {
+                //连接状态完成，或者鉴权成功
+                case COMPLETED:
+                case FOUR_WAY_HANDSHAKE:
+                    if (isAlreadyConnected(mWifiManager, of(mScanResult).next(scanResult -> scanResult.BSSID).get())) {
+                        handler.removeCallbacks(handlerCallback);
+                        mWifiConnectionCallback.successfulConnect();
+                    }
+                    break;
+                case DISCONNECTED:
+                    //授权失败
+                    if (supl_error == WifiManager.ERROR_AUTHENTICATING) {
+                        wifiLog("Authentication error...");
+                        handler.removeCallbacks(handlerCallback);
+                        mWifiConnectionCallback.errorConnect();
+                    } else {
+                        wifiLog("Disconnected. Re-attempting to connect...");
+                        //尝试重新连接
+                        reEnableNetworkIfPossible(mWifiManager, mScanResult);
+                    }
+            }
+        }
+    }
+
+    public void setTimeout(long millis) {
+        this.mDelay = millis;
+    }
+
+    @NonNull
+    public WifiConnectionReceiver activateTimeoutHandler(@NonNull ScanResult result) {
+        mScanResult = result;
+        handler.postDelayed(handlerCallback, mDelay);
+        return this;
+    }
+}
